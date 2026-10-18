@@ -1,0 +1,22 @@
+name: cliproxyapi
+services:
+  gateway:
+    build:
+      context: ../..
+      dockerfile: deploy/tailnet/Dockerfile
+    image: cliproxyapi-session-balanced:local
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8317:8317"
+    volumes:
+      - ./runtime:/data
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 60s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

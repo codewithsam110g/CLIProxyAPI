@@ -56,6 +56,9 @@ func (s *Service) Run(ctx context.Context) error {
 	s.startModelCatalogUpdaters(ctx)
 
 	usage.StartDefault(ctx)
+	if s.coreManager != nil {
+		usage.RegisterNamedPlugin("session-balanced-routing", balancedUsageSink{manager: s.coreManager})
+	}
 	cfg := s.currentConfig()
 	homeEnabled := cfg != nil && cfg.Home.Enabled
 	if homeEnabled {

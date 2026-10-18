@@ -91,6 +91,9 @@ retain the corresponding business operation's fields.
 | `/server/latest-version` | GET | Get latest release information. |
 | `/requests/api-call` | POST | Make an authenticated upstream call. |
 | `/routing/cooldown/reset` | POST | Clear credential cooldown. |
+| `/routing/sessions` | GET | Session-balanced routing snapshot (fork extension). |
+| `/routing/sessions/move` | POST | Request a deferred account move with expected binding generation (fork extension). |
+| `/routing/accounts/drain` | POST | Stop/resume new assignments to an account (fork extension). |
 | `/routing/model-definitions/<channel>` | GET | Get model definitions. |
 | `/observability/logs` | GET, DELETE | Read or clear application logs. |
 | `/observability/logs/errors` | GET | List error-log files. |
@@ -161,3 +164,13 @@ accepts legacy, new, or mixed layouts, normalizing v8 documents on save.
 
 Plugin OAuth uses the shared v8 login endpoint. Other plugin-defined HTTP
 extensions retain their declared `/v0/management` routes.
+
+## Session-balanced routing extension
+
+These routes share the v8 management authentication boundary. `GET /routing/sessions` returns `enabled`, `sessions`, `accounts` and optional `state_error`. Disabled mode returns empty arrays and `enabled:false`. Snapshot data contains routing metadata and canonical token counters, never provider credentials.
+
+`POST /routing/accounts/drain` accepts `{"auth_id":"account-id","draining":true}`. The boolean is required, including when resuming with false. Existing sessions keep their account.
+
+`POST /routing/sessions/move` accepts `{"id":"binding-id","auth_id":"target-id","expected_generation":1}`. The target must be compatible, available and non-draining. The response reports pending status; migration happens only on a subsequent safe request. Stale generations and incompatible targets return 409. Missing/invalid fields return 400. Mutation endpoints return 409 when session-balanced is not enabled.
+
+See [fork policy](../FORK.md) for persistence, failure classification and continuation constraints.

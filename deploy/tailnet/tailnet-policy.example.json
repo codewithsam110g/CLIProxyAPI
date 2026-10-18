@@ -1,0 +1,16 @@
+{
+  "groups": {
+    "group:llm-users": ["you@example.com"]
+  },
+  "tagOwners": {
+    "tag:llm-gateway": ["autogroup:admin"],
+    "tag:llm-ci": ["autogroup:admin"]
+  },
+  "grants": [
+    {
+      "src": ["group:llm-users", "tag:llm-ci"],
+      "dst": ["tag:llm-gateway"],
+      "ip": ["tcp:443"]
+    }
+  ]
+}

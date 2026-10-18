@@ -432,6 +432,16 @@ func (m *Manager) SetSelector(selector Selector) {
 		m.mu.Unlock()
 		return
 	}
+	if balanced, ok := selector.(*SessionBalancedSelector); ok {
+		m.mu.Unlock()
+		if stoppable, ok := oldSelector.(StoppableSelector); ok {
+			stoppable.Stop()
+		}
+		balanced.reload()
+		m.attachBalancedSelector(selector)
+		m.mu.Lock()
+		oldSelector = nil
+	}
 	m.selector = selector
 	m.mu.Unlock()
 
@@ -623,6 +633,9 @@ func (m *Manager) availableAuthsForRouteModelWithPriorityMode(auths []*Auth, pro
 // or scheduler additionally receives lower priority tiers.
 func (m *Manager) availableAuthsForSelector(selector Selector, auths []*Auth, provider, routeModel string, now time.Time) (priorityAuths, selectorAuths []*Auth, err error) {
 	_, sessionAffinity := selector.(*SessionAffinitySelector)
+	if _, balanced := selector.(*SessionBalancedSelector); balanced {
+		sessionAffinity = true
+	}
 	schedulerAcross := m.pluginSchedulerWantsAcrossPrioritiesLocked()
 
 	if !sessionAffinity && !schedulerAcross {
@@ -976,6 +989,9 @@ func (m *Manager) pickViaBuiltinScheduler(ctx context.Context, strategy schedule
 }
 
 func (m *Manager) pickViaPluginScheduler(ctx context.Context, scheduler PluginScheduler, provider string, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}, candidates []*Auth) (*Auth, bool, error) {
+	if _, ownsPins := m.Selector().(*SessionBalancedSelector); ownsPins {
+		return nil, false, nil // Native binding ownership must not be bypassed by a plugin.
+	}
 	if scheduler == nil || len(candidates) == 0 {
 		return nil, false, nil
 	}

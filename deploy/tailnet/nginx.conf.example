@@ -1,0 +1,30 @@
+# Install inside Nginx's http {} context. Replace IP, hostname and certificate paths.
+# Map may already exist in your shared Nginx config; define it only once.
+map $http_upgrade $cliproxy_connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+server {
+    listen 100.64.0.10:443 ssl; # Replace with the hosting machine's Tailscale IPv4.
+    server_name gateway.your-tailnet.ts.net;
+    ssl_certificate /etc/nginx/tailscale/gateway.crt;
+    ssl_certificate_key /etc/nginx/tailscale/gateway.key;
+    client_max_body_size 64m;
+
+    location / {
+        proxy_pass http://127.0.0.1:8317;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $cliproxy_connection_upgrade;
+        proxy_buffering off;
+        proxy_request_buffering off;
+        proxy_cache off;
+        proxy_next_upstream off;
+        # Long idle windows for SSE and WebSockets; these are idle, not total request limits.
+        proxy_read_timeout 1d;
+        proxy_send_timeout 1d;
+    }
+}

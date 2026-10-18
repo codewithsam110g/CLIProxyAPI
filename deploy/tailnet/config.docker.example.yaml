@@ -1,0 +1,20 @@
+config-version: 8
+server:
+  host: "0.0.0.0" # Inside container only; host port is loopback-bound.
+  port: 8317
+  discovery:
+    enabled: false
+management:
+  allow-remote: true # Docker bridge source is not localhost. Host port stays private.
+  secret-key: "REPLACE_WITH_A_RANDOM_MANAGEMENT_KEY"
+  disable-control-panel: false
+  disable-auto-update-panel: true
+  panel-github-repository: "https://github.com/codewithsam110g/Cli-Proxy-API-Management-Center"
+access:
+  api-keys:
+    - "REPLACE_WITH_A_DIFFERENT_RANDOM_CLIENT_KEY"
+oauth:
+  auth-dir: "/data/auths"
+routing:
+  strategy: "session-balanced"
+  session-affinity-ttl: "24h"

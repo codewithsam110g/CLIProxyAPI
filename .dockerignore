@@ -39,3 +39,8 @@ bin
 .bmad
 _bmad
 _bmad-output
+
+# Local review and deployment state
+audit
+dossier
+deploy/tailnet/runtime

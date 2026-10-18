@@ -1362,6 +1362,9 @@ func shouldAttemptAntigravityCreditsFallback(m *Manager, lastErr error, provider
 	if m == nil || lastErr == nil || m.HomeEnabled() {
 		return false
 	}
+	if _, ownsPins := m.Selector().(*SessionBalancedSelector); ownsPins {
+		return false
+	}
 	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
 	if cfg == nil || !cfg.QuotaExceeded.AntigravityCredits {
 		return false

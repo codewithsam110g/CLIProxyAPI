@@ -1,0 +1,23 @@
+[Unit]
+Description=CLIProxyAPI session gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=cliproxy
+Group=cliproxy
+WorkingDirectory=/var/lib/cliproxyapi
+Environment=MANAGEMENT_STATIC_PATH=/opt/cliproxyapi/static
+ExecStart=/opt/cliproxyapi/cli-proxy-api --config /var/lib/cliproxyapi/config.yaml --local-model
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=60
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/cliproxyapi
+
+[Install]
+WantedBy=multi-user.target

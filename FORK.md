@@ -46,6 +46,8 @@ Initial assignments, moves and drain changes are synced to a temporary file and 
 
 Run exactly one process against the directory. This file store does not provide cross-process locking, replicated ownership or multi-host failover. Switching back to an upstream strategy stops enforcing these pins; switching back before expiry reloads saved bindings.
 
+Management OAuth callback forwarders bind to `127.0.0.1`, so opening the dashboard login flow does not expose a callback port on the LAN. Remote login uses callback submission or an SSH tunnel.
+
 A request with `previous_response_id` or a transport-pinned account cannot safely migrate as a delta. It receives 409 with a reconnect/full-history replay message. After visible streaming output, the existing stream boundary stops replay; the new selector does not add a retry layer. A manual move stays pending until a safe subsequent request. No eligible replacement means an error with the original ownership retained, not paid/model/provider fallback.
 
 ## Dashboard and API

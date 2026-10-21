@@ -9,6 +9,7 @@ import (
 	"maps"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -6551,6 +6552,115 @@ func TestResponsesWebsocketReplaysImmediatelyAfterPinnedAuthFailure(t *testing.T
 			}
 
 			replayConn, _, errDialReplay := websocket.DefaultDialer.Dial(wsURL, nil)
+			if errDialReplay != nil {
+				t.Fatalf("dial replay websocket: %v", errDialReplay)
+			}
+			defer func() { _ = replayConn.Close() }()
+			fullReplay := fmt.Sprintf(`{"type":"response.create","model":%q,"input":[{"type":"message","id":"msg-1"},{"type":"message","id":"out-auth-a-1"},{"type":"message","id":"msg-2"}]}`, modelName)
+			if errWrite := replayConn.WriteMessage(websocket.TextMessage, []byte(fullReplay)); errWrite != nil {
+				t.Fatalf("write full replay: %v", errWrite)
+			}
+			if _, replayPayload, errReadReplay := replayConn.ReadMessage(); errReadReplay != nil || gjson.GetBytes(replayPayload, "type").String() != wsEventTypeCompleted {
+				t.Fatalf("full replay response = %s, err=%v", replayPayload, errReadReplay)
+			}
+			if got := executor.AuthIDs(); len(got) != 3 || got[2] != "auth-b" {
+				t.Fatalf("selected auth IDs after replay = %v, want [auth-a auth-a auth-b]", got)
+			}
+			authBPayloads := executor.Payloads("auth-b")
+			if len(authBPayloads) != 1 {
+				t.Fatalf("auth-b payloads = %d, want 1", len(authBPayloads))
+			}
+			authBPayload := authBPayloads[0]
+			if gjson.GetBytes(authBPayload, "previous_response_id").Exists() || len(gjson.GetBytes(authBPayload, "input").Array()) != 3 {
+				t.Fatalf("auth-b did not receive full replay: %s", authBPayload)
+			}
+		})
+	}
+}
+
+func TestResponsesWebsocketSessionBalancedReconnectsAfterAccountFailure(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	tests := []struct {
+		name            string
+		status          int
+		backupWebsocket bool
+	}{
+		{name: "unauthorized to websocket", status: http.StatusUnauthorized, backupWebsocket: true},
+		{name: "unauthorized to http", status: http.StatusUnauthorized, backupWebsocket: false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			modelName := fmt.Sprintf("balanced-credential-failure-%d-%t-model", tc.status, tc.backupWebsocket)
+			selector := coreauth.NewSessionBalancedSelector(filepath.Join(t.TempDir(), "routing.state"), time.Hour)
+			defer selector.Stop()
+			executor := &websocketPinnedFailoverExecutor{failStatus: tc.status}
+			manager := coreauth.NewManager(nil, selector, nil)
+			manager.RegisterExecutor(executor)
+
+			authA := &coreauth.Auth{
+				ID:         "auth-a",
+				Provider:   executor.Identifier(),
+				Status:     coreauth.StatusActive,
+				Attributes: map[string]string{"websockets": "true"},
+			}
+			if _, err := manager.Register(context.Background(), authA); err != nil {
+				t.Fatalf("Register auth A: %v", err)
+			}
+			authB := &coreauth.Auth{
+				ID:         "auth-b",
+				Provider:   executor.Identifier(),
+				Status:     coreauth.StatusActive,
+				Attributes: map[string]string{"websockets": strconv.FormatBool(tc.backupWebsocket)},
+			}
+			if _, err := manager.Register(context.Background(), authB); err != nil {
+				t.Fatalf("Register auth B: %v", err)
+			}
+
+			registry.GetGlobalRegistry().RegisterClient(authA.ID, authA.Provider, []*registry.ModelInfo{{ID: modelName}})
+			registry.GetGlobalRegistry().RegisterClient(authB.ID, authB.Provider, []*registry.ModelInfo{{ID: modelName}})
+			t.Cleanup(func() {
+				registry.GetGlobalRegistry().UnregisterClient(authA.ID)
+				registry.GetGlobalRegistry().UnregisterClient(authB.ID)
+			})
+
+			base := handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
+			h := NewOpenAIResponsesAPIHandler(base)
+			router := gin.New()
+			router.GET("/v1/responses/ws", h.ResponsesWebsocket)
+
+			server := httptest.NewServer(router)
+			defer server.Close()
+
+			wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/v1/responses/ws"
+			conn, _, err := websocket.DefaultDialer.Dial(wsURL, http.Header{"Session-Id": {"balanced-stable-thread"}})
+			if err != nil {
+				t.Fatalf("dial websocket: %v", err)
+			}
+			defer func() { _ = conn.Close() }()
+
+			firstRequest := fmt.Sprintf(`{"type":"response.create","model":%q,"input":[{"type":"message","id":"msg-1"}]}`, modelName)
+			if errWrite := conn.WriteMessage(websocket.TextMessage, []byte(firstRequest)); errWrite != nil {
+				t.Fatalf("write first websocket message: %v", errWrite)
+			}
+			if _, payload, errRead := conn.ReadMessage(); errRead != nil || gjson.GetBytes(payload, "type").String() != wsEventTypeCompleted {
+				t.Fatalf("first websocket response = %s, err=%v", payload, errRead)
+			}
+
+			secondRequest := `{"type":"response.create","previous_response_id":"resp-auth-a-1","input":[{"type":"message","id":"msg-2"}]}`
+			if errWrite := conn.WriteMessage(websocket.TextMessage, []byte(secondRequest)); errWrite != nil {
+				t.Fatalf("write second websocket message: %v", errWrite)
+			}
+			_, _, errReadClose := conn.ReadMessage()
+			var replayClose *websocket.CloseError
+			if !errors.As(errReadClose, &replayClose) || replayClose.Code != websocket.CloseServiceRestart || replayClose.Text != wsHTTPReplayRequiredCloseReason {
+				t.Fatalf("credential failure response = %v, want replay close %d %q", errReadClose, websocket.CloseServiceRestart, wsHTTPReplayRequiredCloseReason)
+			}
+			if got := executor.AuthIDs(); len(got) != 2 || got[0] != "auth-a" || got[1] != "auth-a" {
+				t.Fatalf("selected auth IDs before replay = %v, want [auth-a auth-a]", got)
+			}
+
+			replayConn, _, errDialReplay := websocket.DefaultDialer.Dial(wsURL, http.Header{"Session-Id": {"balanced-stable-thread"}})
 			if errDialReplay != nil {
 				t.Fatalf("dial replay websocket: %v", errDialReplay)
 			}

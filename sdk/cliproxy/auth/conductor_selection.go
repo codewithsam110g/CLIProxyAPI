@@ -633,7 +633,8 @@ func (m *Manager) availableAuthsForRouteModelWithPriorityMode(auths []*Auth, pro
 // or scheduler additionally receives lower priority tiers.
 func (m *Manager) availableAuthsForSelector(selector Selector, auths []*Auth, provider, routeModel string, now time.Time) (priorityAuths, selectorAuths []*Auth, err error) {
 	_, sessionAffinity := selector.(*SessionAffinitySelector)
-	if _, balanced := selector.(*SessionBalancedSelector); balanced {
+	_, balanced := selector.(*SessionBalancedSelector)
+	if balanced {
 		sessionAffinity = true
 	}
 	schedulerAcross := m.pluginSchedulerWantsAcrossPrioritiesLocked()
@@ -651,6 +652,11 @@ func (m *Manager) availableAuthsForSelector(selector Selector, auths []*Auth, pr
 	// subset of the across-priority candidates, so it is narrowed from the same cloned auths.
 	allAuths, errAcross := m.availableAuthsForRouteModelAcrossPriorities(auths, provider, routeModel, now)
 	if errAcross != nil {
+		if balanced {
+			// The session owner must classify unavailable pins and unsafe continuations,
+			// even when cooldown/transport filtering leaves no eligible replacement.
+			return nil, nil, nil
+		}
 		return nil, nil, errAcross
 	}
 	allAuths = cloneAuthSlice(allAuths)
@@ -1840,6 +1846,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 
 	m.mu.RLock()
 	selector := m.selector
+	_, balanced := selector.(*SessionBalancedSelector)
 	opts.Metadata[cliproxyexecutor.SessionAffinityModelMetadataKey] = selectionArgForSelector(selector, model)
 	pluginScheduler := m.pluginScheduler
 	executor, okExecutor := m.executorLocked(provider)
@@ -1868,7 +1875,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		if candidate == nil || canonicalSchedulingProvider(executorKeyFromAuth(candidate)) != targetKey || candidate.Disabled {
 			continue
 		}
-		if pinnedAuthID != "" && candidate.ID != pinnedAuthID {
+		if !balanced && pinnedAuthID != "" && candidate.ID != pinnedAuthID {
 			continue
 		}
 		if !eligibility.allows(candidate) {
@@ -1885,7 +1892,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		}
 		candidates = append(candidates, candidate)
 	}
-	if len(candidates) == 0 {
+	if len(candidates) == 0 && !balanced {
 		m.mu.RUnlock()
 		return nil, nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
@@ -2182,6 +2189,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 
 	m.mu.RLock()
 	selector := m.selector
+	_, balanced := selector.(*SessionBalancedSelector)
 	opts.Metadata[cliproxyexecutor.SessionAffinityModelMetadataKey] = selectionArgForSelector(selector, model)
 	pluginScheduler := m.pluginScheduler
 	candidates := make([]*Auth, 0, len(m.auths))
@@ -2204,7 +2212,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		if candidate == nil || candidate.Disabled {
 			continue
 		}
-		if pinnedAuthID != "" && candidate.ID != pinnedAuthID {
+		if !balanced && pinnedAuthID != "" && candidate.ID != pinnedAuthID {
 			continue
 		}
 		if !eligibility.allows(candidate) {
@@ -2231,7 +2239,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		}
 		candidates = append(candidates, candidate)
 	}
-	if len(candidates) == 0 {
+	if len(candidates) == 0 && !balanced {
 		m.mu.RUnlock()
 		return nil, nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
 	}

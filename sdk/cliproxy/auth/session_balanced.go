@@ -8,12 +8,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math"
 	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -67,9 +65,10 @@ type SessionBinding struct {
 }
 
 type balancedState struct {
-	Version  int                        `json:"version"`
-	Sessions map[string]*SessionBinding `json:"sessions"`
-	Draining map[string]bool            `json:"draining"`
+	Version    int                                    `json:"version"`
+	Sessions   map[string]*SessionBinding             `json:"sessions"`
+	Draining   map[string]bool                        `json:"draining"`
+	QuotaStops map[string]map[string]sessionQuotaStop `json:"quota_stops,omitempty"`
 }
 
 type RoutingAccount struct {
@@ -81,6 +80,8 @@ type RoutingAccount struct {
 	RecentSessions   int       `json:"recent_sessions"`
 	RemainingPercent *float64  `json:"remaining_percent"`
 	ObservedAt       time.Time `json:"observed_at"`
+	QuotaStopped     bool      `json:"quota_stopped"`
+	QuotaStopReason  string    `json:"quota_stop_reason,omitempty"`
 }
 
 type BalancedRoutingSnapshot struct {
@@ -159,6 +160,22 @@ func (s *SessionBalancedSelector) reload() {
 	s.state = state
 	if s.state.Draining == nil {
 		s.state.Draining = map[string]bool{}
+	}
+	if len(s.state.QuotaStops) > 4096 {
+		s.loadErr = errors.New("oversized quota stop state")
+		return
+	}
+	for _, windows := range s.state.QuotaStops {
+		if len(windows) > 5 {
+			s.loadErr = errors.New("invalid quota stop state")
+			return
+		}
+		for name, stop := range windows {
+			if !validSessionQuotaStop(name, stop) {
+				s.loadErr = errors.New("invalid quota stop state")
+				return
+			}
+		}
 	}
 	s.rebuildAliases()
 }
@@ -278,6 +295,11 @@ func (s *SessionBalancedSelector) Pick(ctx context.Context, provider, model stri
 	if primary == "" {
 		return nil, routingError("session_id_required", "session-balanced routing requires a stable session ID or replayable conversation root", 400)
 	}
+	if s.refreshQuotaStops(auths, now) {
+		if err := s.persist(); err != nil {
+			return nil, routingError("session_state_unavailable", "quota stops could not be persisted", 503)
+		}
+	}
 	scope := sessionMetadataString(opts.Metadata, executor.CallerScopeMetadataKey)
 	key := balancedKey(scope, provider, model, primary)
 	b := s.lookup(key, now)
@@ -300,7 +322,18 @@ func (s *SessionBalancedSelector) Pick(ctx context.Context, provider, model stri
 	}
 	reason := "quota and recent-session load"
 	if b != nil && b.PendingReason == "" {
+		if stopped := s.quotaStopReason(b.AuthID); stopped != "" {
+			b.PendingReason = stopped
+			if err := s.persist(); err != nil {
+				return nil, routingError("session_state_unavailable", "session migration could not be persisted", 503)
+			}
+		}
+	}
+	if b != nil && b.PendingReason == "" {
 		if a := pickByID(b.AuthID); a != nil {
+			if pinned := pinnedAuthIDFromMetadata(opts.Metadata); pinned != "" && pinned != b.AuthID {
+				return nil, sessionReconnectRequired()
+			}
 			b.LastSeen = now
 			b.ExpiresAt = now.Add(s.ttl)
 			s.tag(opts, b)
@@ -315,18 +348,30 @@ func (s *SessionBalancedSelector) Pick(ctx context.Context, provider, model stri
 		a := s.account(b.AuthID)
 		if s.accounts != nil && (a == nil || a.Disabled || a.Status == StatusDisabled || hasUnauthorizedAuthFailure(a)) {
 			b.PendingReason = "account unavailable"
+			if err := s.persist(); err != nil {
+				return nil, routingError("session_state_unavailable", "session migration could not be persisted", 503)
+			}
 		} else {
 			return nil, routingError("session_account_unavailable", "the pinned account is temporarily unavailable; retry this session on the same account", 503)
 		}
 	}
+	if b != nil && b.PendingReason != "" && (gjson.GetBytes(opts.OriginalRequest, "previous_response_id").String() != "" || pinnedAuthIDFromMetadata(opts.Metadata) != "") {
+		return nil, sessionReconnectRequired()
+	}
 	var chosen *Auth
 	if b != nil && b.PendingAuthID != "" {
 		chosen = pickByID(b.PendingAuthID)
-		if chosen == nil || s.state.Draining[chosen.ID] || chosen.Provider != b.Provider {
+		if chosen == nil || s.state.Draining[chosen.ID] || s.quotaStopReason(chosen.ID) != "" || chosen.Provider != b.Provider {
 			return nil, routingError("session_target_unavailable", "the requested target account is not eligible for this request", 503)
 		}
 		reason = "manual move"
-	} else if b == nil && parentBinding != nil && isSubagentSession(primary, parent) {
+	} else if b == nil && pinnedAuthIDFromMetadata(opts.Metadata) != "" {
+		chosen = pickByID(pinnedAuthIDFromMetadata(opts.Metadata))
+		if chosen == nil || s.quotaStopReason(chosen.ID) != "" {
+			return nil, sessionReconnectRequired()
+		}
+		reason = "transport session"
+	} else if b == nil && parentBinding != nil && isSubagentSession(primary, parent) && s.quotaStopReason(parentBinding.AuthID) == "" {
 		chosen = pickByID(parentBinding.AuthID)
 		if chosen == nil {
 			return nil, routingError("session_account_unavailable", "the parent session account is unavailable", 503)
@@ -335,7 +380,7 @@ func (s *SessionBalancedSelector) Pick(ctx context.Context, provider, model stri
 	} else {
 		candidates := make([]*Auth, 0, len(auths))
 		for _, a := range auths {
-			if a == nil || s.state.Draining[a.ID] || authWeight(a) <= 0 {
+			if a == nil || s.state.Draining[a.ID] || authWeight(a) <= 0 || s.quotaStopReason(a.ID) != "" {
 				continue
 			}
 			if b != nil && (a.Provider != b.Provider || a.ID == b.AuthID) {
@@ -373,7 +418,7 @@ func (s *SessionBalancedSelector) Pick(ctx context.Context, provider, model stri
 	if b != nil && chosen.ID != b.AuthID {
 		// Delta continuations belong to the previous upstream account. Never replay them blindly.
 		if gjson.GetBytes(opts.OriginalRequest, "previous_response_id").String() != "" || pinnedAuthIDFromMetadata(opts.Metadata) != "" {
-			return nil, routingError("session_reconnect_required", "account migration requires a new connection and a full conversation replay", 409)
+			return nil, sessionReconnectRequired()
 		}
 		reason = b.PendingReason
 		b.Migrations = append(b.Migrations, SessionMigration{At: now, From: b.AuthID, To: chosen.ID, Reason: reason})
@@ -465,9 +510,17 @@ func (s *SessionBalancedSelector) OnResult(r Result) {
 	} else {
 		b.Failures++
 	}
-	if reason := confirmedSessionFailure(r); reason != "" && b.PendingReason == "" {
-		b.PendingReason = reason
+	if reason := confirmedSessionFailure(r); reason != "" {
+		if b.PendingReason == "" {
+			b.PendingReason = reason
+		}
+		if statusCodeFromResult(r.Error) == http.StatusTooManyRequests {
+			s.recordConfirmedQuotaStop(r)
+		}
 		_ = s.persist() // A failed commit blocks subsequent selections via storeErr.
+	}
+	if s.refreshQuotaStops(nil, s.now()) {
+		_ = s.persist()
 	}
 }
 
@@ -477,6 +530,7 @@ func (s *SessionBalancedSelector) InvalidateAuth(id string) {
 	if s.stopped {
 		return
 	}
+	delete(s.state.QuotaStops, id)
 	for _, b := range s.state.Sessions {
 		if b.AuthID == id {
 			b.PendingReason = "account removed"
@@ -505,40 +559,16 @@ func accountHeadroom(a *Auth, now time.Time) (*float64, time.Time) {
 	min := 100.0
 	found := false
 	var reset time.Time
-	for name, value := range a.Quota.Signals {
-		name = strings.ToLower(name)
-		if strings.HasSuffix(name, "-reset-at") || name == "anthropic-ratelimit-unified-5h-reset" || name == "anthropic-ratelimit-unified-7d-reset" {
-			var t time.Time
-			if unix, err := strconv.ParseInt(value, 10, 64); err == nil {
-				t = time.Unix(unix, 0)
-			} else {
-				t, _ = time.Parse(time.RFC3339, value)
-			}
-			if t.After(now) && (reset.IsZero() || t.Before(reset)) {
-				reset = t
-			}
-		}
-		fraction := false
-		switch name {
-		case "x-codex-primary-used-percent", "x-codex-secondary-used-percent":
-		case "anthropic-ratelimit-unified-5h-utilization", "anthropic-ratelimit-unified-7d-utilization":
-			fraction = true
-		default:
-			continue
-		}
-		used, err := strconv.ParseFloat(value, 64)
-		if err != nil || math.IsNaN(used) || math.IsInf(used, 0) {
-			continue
-		}
-		if fraction {
-			used *= 100
-		}
-		if used < 0 || used > 100 {
+	for _, window := range quotaWindowObservations(a) {
+		if !window.ResetAt.IsZero() && !now.Before(window.ResetAt) {
 			continue
 		}
 		found = true
-		if remaining := 100 - used; remaining < min {
-			min = remaining
+		if window.RemainingPercent < min {
+			min = window.RemainingPercent
+		}
+		if window.ResetAt.After(now) && (reset.IsZero() || window.ResetAt.Before(reset)) {
+			reset = window.ResetAt
 		}
 	}
 	if !found {
@@ -557,6 +587,11 @@ func (s *SessionBalancedSelector) Snapshot() BalancedRoutingSnapshot {
 		out.StateError = "session state could not be persisted"
 	}
 	now := s.now()
+	if s.loadErr == nil && !s.stopped && s.refreshQuotaStops(nil, now) {
+		if err := s.persist(); err != nil {
+			out.StateError = "session state could not be persisted"
+		}
+	}
 	for _, b := range s.state.Sessions {
 		if now.Before(b.ExpiresAt) {
 			copy := *b
@@ -572,7 +607,8 @@ func (s *SessionBalancedSelector) Snapshot() BalancedRoutingSnapshot {
 				continue
 			}
 			remaining, _ := accountHeadroom(a, now)
-			out.Accounts = append(out.Accounts, RoutingAccount{ID: a.ID, Label: a.Label, Provider: a.Provider, Disabled: a.Disabled || a.Status == StatusDisabled, Draining: s.state.Draining[a.ID], RecentSessions: s.recentSessions(a.ID, now), RemainingPercent: remaining, ObservedAt: a.Quota.ObservedAt})
+			stopReason := s.quotaStopReason(a.ID)
+			out.Accounts = append(out.Accounts, RoutingAccount{ID: a.ID, Label: a.Label, Provider: a.Provider, Disabled: a.Disabled || a.Status == StatusDisabled, Draining: s.state.Draining[a.ID], RecentSessions: s.recentSessions(a.ID, now), RemainingPercent: remaining, ObservedAt: a.Quota.ObservedAt, QuotaStopped: stopReason != "", QuotaStopReason: stopReason})
 		}
 	}
 	sort.Slice(out.Accounts, func(i, j int) bool { return out.Accounts[i].ID < out.Accounts[j].ID })
@@ -606,6 +642,14 @@ func (s *SessionBalancedSelector) RequestMove(id, target string, generation uint
 		return errors.New("session changed; refresh before moving")
 	}
 	a := s.account(target)
+	if s.refreshQuotaStops(nil, s.now()) {
+		if err := s.persist(); err != nil {
+			return err
+		}
+	}
+	if s.quotaStopReason(target) != "" {
+		return errors.New("target account has reached the quota stop")
+	}
 	if a != nil {
 		if blocked, _, _ := isAuthBlockedForModel(a, b.Model, s.now()); blocked {
 			return errors.New("target account is unavailable")

@@ -281,7 +281,7 @@ func isHomeRequestRetryExceededError(err error) bool {
 }
 
 func shouldReturnLastErrorOnPickFailure(homeMode bool, lastErr error, errPick error) bool {
-	if lastErr == nil {
+	if lastErr == nil || IsSessionReconnectRequired(errPick) {
 		return false
 	}
 	if !homeMode {

@@ -136,6 +136,18 @@ For rollback, stop the gateway and restore the matching artifact pair and compat
 
 If state is corrupt or unwritable, routing fails closed rather than silently redistributing sessions. Stop the service, repair permissions or restore the backup, then restart. Deleting the state file deliberately abandons pins and drain settings; do that only as a conscious recovery choice.
 
+## Existing homelab native upgrade
+
+The deployed homelab uses `cliproxyapi-tailnet.socket` and `cliproxyapi-tailnet.service` to forward the Tailscale listener to `127.0.0.1:18317`. Its current configuration and account enable/disable flags must be retained; do not rerun the first-install script for an upgrade.
+
+`upgrade-native.py` consumes a prepared bundle containing `cli-proxy-api`, `management.html`, `SOURCE_REVISIONS.txt` and a JSON SHA-256 `manifest.json`. Run it with interactive sudo on the host after reviewing the bundle. It validates hashes, snapshots current session metadata, stops only these gateway units, streams `/opt/cliproxyapi` and `/var/lib/cliproxyapi` into an encrypted backup, atomically installs the artifact pair, verifies authenticated reads and binding generations, and restores ingress. Active HTTP streams and WebSockets are interrupted by the restart and must reconnect. It does not alter Tailscale, firewall rules, unit files, credentials, account disable flags or client keys.
+
+Encrypted archives are root-only under `/var/backups/cliproxyapi`; the generated encryption key stays separately under `/root/.config/cliproxyapi-backups/key`. Preserve that key separately when copying backups off-host. The updater prints an exact rollback command. Artifact rollback retains the latest credential files and pins; the older release reads the unchanged version-1 state format and ignores additive quota-stop metadata. A failed activation automatically restores the previous artifacts before restoring ingress.
+
+Request logging is enabled through the authenticated v8 configuration API using `observability.logs.request-log: true` and a 512 MiB total log-directory cap. Application logs remain enabled. Request/response logs contain application payloads and are kept on the hosting machine; management traffic is excluded. The updater verifies these settings but does not replace the existing config file.
+
+The 1% reserve applies to both shared Claude/Codex windows, including existing pins. Stopped windows are durable until their reset or a newer fresh recovery observation. Existing explicitly disabled accounts remain disabled after upgrade; operators can resume them deliberately after confirming provider recovery. Unknown quota still requires a first provider response to learn its limits; dashboard probes are not a routing telemetry source.
+
 ## Verification boundary
 
 Backend tests and frontend checks were run on macOS; see the fork notes for results. These templates were statically checked. Docker daemon, Nginx, systemd and your remote Linux/Windows hosts were not available for live deployment validation. No real Claude/Codex OAuth account was exercised. Measure provider cache-read tokens after a controlled live rollout; stable account routing preserves the opportunity for a cache hit but cannot guarantee a provider cache hit.

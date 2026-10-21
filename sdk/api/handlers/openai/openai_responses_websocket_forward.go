@@ -346,6 +346,9 @@ func writeResponsesWebsocketTerminalError(
 }
 
 func shouldReplayResponsesWebsocketPinnedAuthFailure(errMsg *interfaces.ErrorMessage) bool {
+	if errMsg != nil && coreauth.IsSessionReconnectRequired(errMsg.Error) {
+		return true
+	}
 	switch responsesWebsocketErrorStatus(errMsg) {
 	case http.StatusUnauthorized, http.StatusTooManyRequests:
 		return true

@@ -754,6 +754,9 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		// A connection-scoped continuation cannot rotate credentials in place. Suppress
 		// credential errors and make the client replay the full turn on a new socket.
 		replayPinnedAuthFailure := func(errMsg *interfaces.ErrorMessage) bool {
+			if errMsg != nil && coreauth.IsSessionReconnectRequired(errMsg.Error) {
+				return true
+			}
 			return nativeWebsocketPassthrough && requestRequiresCurrentUpstreamWebsocket && pinnedAuthAttempted &&
 				shouldReplayResponsesWebsocketPinnedAuthFailure(errMsg)
 		}

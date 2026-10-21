@@ -367,7 +367,7 @@ func TestSessionBalancedQuotaFreshnessAndUnknown(t *testing.T) {
 		age         time.Duration
 		want        *float64
 	}{
-		{"stale", "20", 6 * time.Minute, nil}, {"invalid", "NaN", 0, nil}, {"range", "150", 0, nil},
+		{"stale", "20", 6 * time.Minute, nil}, {"invalid", "NaN", 0, nil}, {"negative", "-1", 0, nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			a := &Auth{Quota: QuotaState{ObservedAt: now.Add(-tc.age), Signals: map[string]string{"x-codex-primary-used-percent": tc.value}}}

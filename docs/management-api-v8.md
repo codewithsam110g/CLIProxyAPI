@@ -167,7 +167,7 @@ extensions retain their declared `/v0/management` routes.
 
 ## Session-balanced routing extension
 
-These routes share the v8 management authentication boundary. `GET /routing/sessions` returns `enabled`, `sessions`, `accounts` and optional `state_error`. Disabled mode returns empty arrays and `enabled:false`. Snapshot data contains routing metadata and canonical token counters, never provider credentials.
+These routes share the v8 management authentication boundary. `GET /routing/sessions` returns `enabled`, `sessions`, `accounts` and optional `state_error`. Disabled mode returns empty arrays and `enabled:false`. Snapshot data contains routing metadata and canonical token counters, never provider credentials. Account entries include `quota_stopped` and `quota_stop_reason`. A shared window at 1% remaining or less stops both new assignments and existing pinned requests; each conversation migrates on its next safe request. Stops survive stale or missing scoring observations until the window resets or a newer fresh observation confirms recovery.
 
 `POST /routing/accounts/drain` accepts `{"auth_id":"account-id","draining":true}`. The boolean is required, including when resuming with false. Existing sessions keep their account.
 

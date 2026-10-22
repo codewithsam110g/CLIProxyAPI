@@ -536,3 +536,48 @@ func TestSessionReserveMovesOnlyWhenRoomExists(t *testing.T) {
 		t.Fatalf("reserve stop flags: %+v", entry)
 	}
 }
+
+func TestSessionQuotaPendingMoveClearsAfterVerifiedRecovery(t *testing.T) {
+	f := newReserveFixture(t, "codex", "")
+	balancedPick(t, f.s, balancedOptions("caller", "quota"), f.pool)
+	balancedPick(t, f.s, balancedOptions("caller", "manual"), f.pool)
+	markPending := func() {
+		f.s.mu.Lock()
+		defer f.s.mu.Unlock()
+		for _, b := range f.s.state.Sessions {
+			if b.AuthID != "a" {
+				t.Fatalf("fixture placed a session on %s", b.AuthID)
+			}
+			b.PendingReason = "5-hour window at 0% remaining (reserve 5%)"
+			if strings.HasSuffix(b.SessionID, "manual") {
+				b.PendingReason = "manual move"
+			}
+		}
+		delete(f.s.state.QuotaStops, "a")
+	}
+	markPending()
+	// No stop is recorded, but a stale observation is not evidence of recovery.
+	f.pool[0].Quota = remainingObservation(f.now.Add(-10*time.Minute), "codex", 60, 50)
+	for _, row := range f.s.Snapshot().Sessions {
+		if row.PendingReason == "" {
+			t.Fatalf("stale observation cleared a pending move: %+v", row)
+		}
+	}
+	f.pool[0].Quota = remainingObservation(*f.now, "codex", 60, 50)
+	sawManual := false
+	for _, row := range f.s.Snapshot().Sessions {
+		want := ""
+		if strings.HasSuffix(row.SessionID, "manual") {
+			want, sawManual = "manual move", true
+		}
+		if row.PendingReason != want {
+			t.Fatalf("pending after recovery = %q, want %q (%s)", row.PendingReason, want, row.SessionID)
+		}
+	}
+	if !sawManual {
+		t.Fatal("fixture lost the manual session")
+	}
+	if got := balancedPick(t, f.s, balancedOptions("caller", "quota"), f.pool); got.ID != "a" {
+		t.Fatalf("recovered conversation moved anyway: %s", got.ID)
+	}
+}

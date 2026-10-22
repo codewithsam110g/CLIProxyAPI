@@ -240,6 +240,7 @@ func (s *SessionBalancedSelector) refreshQuotaStops(candidates []*Auth, now time
 		s.state.QuotaStops = make(map[string]map[string]sessionQuotaStop)
 	}
 	changed := false
+	recovered := make(map[string]bool)
 	for id, windows := range s.state.QuotaStops {
 		for name, stop := range windows {
 			if !stop.ResetAt.IsZero() && !now.Before(stop.ResetAt) {
@@ -313,9 +314,30 @@ func (s *SessionBalancedSelector) refreshQuotaStops(candidates []*Auth, now time
 			s.state.QuotaStops[a.ID] = windows
 		} else {
 			delete(s.state.QuotaStops, a.ID)
+			if fresh && allHealthy {
+				recovered[a.ID] = true
+			}
+		}
+	}
+	// A move requested only because of quota is stale once the account has
+	// verifiably recovered; moving then would discard the cache for nothing.
+	for _, b := range s.state.Sessions {
+		if b.PendingAuthID == "" && recovered[b.AuthID] && quotaPendingReason(b.PendingReason) {
+			b.PendingReason = ""
+			changed = true
 		}
 	}
 	return changed
+}
+
+// quotaPendingReason reports a pending move caused by quota rather than by a
+// manual request or an account failure.
+func quotaPendingReason(reason string) bool {
+	switch reason {
+	case "", "manual move", "account unavailable", "account removed", "account disabled", "account authentication failed":
+		return false
+	}
+	return true
 }
 
 func (s *SessionBalancedSelector) quotaStopReason(id string) string {

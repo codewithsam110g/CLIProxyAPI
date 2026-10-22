@@ -146,7 +146,7 @@ Encrypted archives are root-only under `/var/backups/cliproxyapi`; the generated
 
 Request logging is enabled through the authenticated v8 configuration API using `observability.logs.request-log: true` and a 512 MiB total log-directory cap. Application logs remain enabled. Request/response logs contain application payloads and are kept on the hosting machine; management traffic is excluded. The updater verifies these settings but does not replace the existing config file.
 
-The 1% reserve applies to both shared Claude/Codex windows, including existing pins. Stopped windows are durable until their reset or a newer fresh recovery observation. Existing explicitly disabled accounts remain disabled after upgrade; operators can resume them deliberately after confirming provider recovery. Unknown quota still requires a first provider response to learn its limits; dashboard probes are not a routing telemetry source.
+Quota reserves are configurable per window (`routing.session-quota`, defaults 5% for the 5-hour window and 2% weekly) and soft: conversations move when another account is outside its reserve, otherwise they keep going until the provider limit. The gateway polls Claude/Codex usage every 5 minutes, so idle accounts are known before traffic reaches them. Existing explicitly disabled accounts remain disabled after upgrade. Rollback to a release with the fixed 1% reserve automatically removes recorded stops that release cannot load; they are re-derived from fresh observations.
 
 ## Verification boundary
 

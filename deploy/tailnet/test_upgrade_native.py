@@ -67,5 +67,25 @@ class BackupTests(unittest.TestCase):
                 upgrade.verify("http://127.0.0.1:18317", {}, before, require_upgrade=True)
 
 
+class LegacyStateTests(unittest.TestCase):
+    def test_rollback_drops_only_stops_an_older_release_cannot_load(self):
+        import json
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary) / "auths/.session-affinity.state"
+            state.parent.mkdir()
+            at = "2026-10-22T10:00:00Z"
+            state.write_text(json.dumps({"version": 1, "sessions": {"s": {"auth_id": "a"}}, "quota_stops": {
+                "a": {"anthropic-ratelimit-unified-5h-utilization": {"remaining_percent": 3, "observed_at": at, "reason": "5-hour window at 3% remaining (reserve 5%)"}},
+                "b": {"confirmed": {"remaining_percent": 0, "observed_at": at, "reason": "confirmed quota exhaustion"},
+                      "x-codex-secondary-used-percent": {"remaining_percent": 1, "observed_at": at, "reason": "weekly window at 1% remaining (reserve 2%)"}}}}))
+            state.chmod(0o600)
+            upgrade.legacy_compatible_quota_stops(Path(temporary))
+            document = json.loads(state.read_text())
+            self.assertEqual(document["sessions"], {"s": {"auth_id": "a"}})
+            self.assertEqual(set(document["quota_stops"]), {"b"})
+            self.assertEqual(set(document["quota_stops"]["b"]), {"confirmed", "x-codex-secondary-used-percent"})
+            self.assertEqual(state.stat().st_mode & 0o777, 0o600)
+
+
 if __name__ == "__main__":
     unittest.main()

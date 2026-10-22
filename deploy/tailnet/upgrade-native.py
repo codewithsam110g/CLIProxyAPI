@@ -131,6 +131,46 @@ def restore_artifacts(archive):
             decryption.wait()
 
 
+LEGACY_STOP_WINDOWS = {"confirmed", "anthropic-ratelimit-unified-5h-utilization", "anthropic-ratelimit-unified-7d-utilization", "x-codex-primary-used-percent", "x-codex-secondary-used-percent"}
+
+
+def legacy_compatible_quota_stops(data=None):
+    # Releases before configurable reserves fail closed on any quota stop above 1%
+    # remaining. Stops are re-derived from fresh observations, so dropping the ones
+    # an older binary cannot load keeps pins and avoids a routing outage on rollback.
+    for state in (data or DATA).rglob(".session-affinity.state"):
+        document = json.loads(state.read_text())
+        stops = document.get("quota_stops") or {}
+        changed = False
+        for account in list(stops):
+            windows = stops[account] or {}
+            for name in list(windows):
+                stop = windows[name] or {}
+                remaining = stop.get("remaining_percent", 0)
+                observed = stop.get("observed_at", "")
+                if name not in LEGACY_STOP_WINDOWS or not stop.get("reason") or not observed or observed.startswith("0001-") or not 0 <= remaining <= 1:
+                    del windows[name]
+                    changed = True
+            if not windows:
+                del stops[account]
+                changed = True
+        if changed:
+            info = state.stat()
+            fd, temporary = tempfile.mkstemp(prefix=".routing-", dir=state.parent)
+            try:
+                with os.fdopen(fd, "w") as output:
+                    json.dump(document, output, separators=(",", ":"))
+                    output.flush()
+                    os.fsync(output.fileno())
+                os.chmod(temporary, info.st_mode & 0o777)
+                if os.geteuid() == 0:
+                    os.chown(temporary, info.st_uid, info.st_gid)
+                os.replace(temporary, state)
+            finally:
+                Path(temporary).unlink(missing_ok=True)
+            print("Removed quota stops the restored release cannot load:", state, flush=True)
+
+
 def install_atomic(source, target, mode):
     fd, temporary = tempfile.mkstemp(prefix=".upgrade-", dir=target.parent)
     try:
@@ -170,11 +210,12 @@ def main():
         raise RuntimeError("gateway is not active; inspect it before upgrading")
     print("Stopping gateway and ingress; active connections will reconnect.", flush=True)
     run("systemctl", "stop", *UNITS)
-    archive = args.rollback or BACKUPS / (time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-pre-quota1.tar.gz.enc")
+    archive = args.rollback or BACKUPS / (time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-pre-upgrade.tar.gz.enc")
     installed = False
     try:
         if args.rollback:
             restore_artifacts(archive)
+            legacy_compatible_quota_stops()
         else:
             encrypt_backup(archive)
             print("Encrypted backup:", archive, flush=True)
@@ -202,6 +243,7 @@ def main():
         run("systemctl", "stop", *UNITS)
         if installed:
             restore_artifacts(archive)
+            legacy_compatible_quota_stops()
         run("systemctl", "start", *active)
         print("Previous service restored; inspect the failed upgrade before retrying.", file=sys.stderr)
         raise

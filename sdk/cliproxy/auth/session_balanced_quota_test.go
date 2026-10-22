@@ -64,6 +64,9 @@ func TestSessionBalancedReservePositiveBoundary(t *testing.T) {
 		t.Run(used, func(t *testing.T) {
 			s := NewSessionBalancedSelector("", time.Hour)
 			defer s.Stop()
+			// Pin the original 1% reserve; the configurable defaults are covered
+			// by the per-window reserve tests.
+			s.SetQuotaReserves(SessionQuotaReserves{Short: 1, Long: 1})
 			pool := balancedPool()
 			pool[0].Attributes = map[string]string{"priority": "10"}
 			pool[0].Quota = reserveObservation(time.Now(), "codex", "0", used)
@@ -319,11 +322,32 @@ func TestSessionBalancedQuotaContinuationPreservesReconnectError(t *testing.T) {
 	}
 }
 
-func TestSessionBalancedAllStoppedPreservesOwnershipAndManualTargetRejected(t *testing.T) {
+func TestSessionBalancedAllInReserveKeepsServingOnOwner(t *testing.T) {
+	s, m, pool, e := newReserveTestManager(t)
+	seedReserveSession(t, s, pool, "mixed", "reserve")
+	for _, a := range pool {
+		a.Quota = reserveObservation(time.Now(), "codex", "99", "99")
+		if _, err := m.Update(context.Background(), a); err != nil {
+			t.Fatal(err)
+		}
+	}
+	row := s.Snapshot().Sessions[0]
+	if err := s.RequestMove(row.ID, "b", row.Generation); err == nil {
+		t.Fatal("manual move allowed quota-stopped target")
+	}
+	if _, err := m.Execute(context.Background(), []string{"codex"}, executor.Request{Model: "reserve-model"}, balancedOptions("caller", "reserve")); err != nil {
+		t.Fatalf("all-in-reserve request failed: %v", err)
+	}
+	if len(e.attempts) != 1 || e.attempts[0] != "a" || s.Snapshot().Sessions[0].AuthID != "a" {
+		t.Fatalf("all-in-reserve request left its owner: %v", e.attempts)
+	}
+}
+
+func TestSessionBalancedAllExhaustedPreservesOwnershipAndManualTargetRejected(t *testing.T) {
 	s, m, pool, e := newReserveTestManager(t)
 	seedReserveSession(t, s, pool, "mixed", "stopped")
 	for _, a := range pool {
-		a.Quota = reserveObservation(time.Now(), "codex", "99", "99")
+		a.Quota = reserveObservation(time.Now(), "codex", "100", "100")
 		if _, err := m.Update(context.Background(), a); err != nil {
 			t.Fatal(err)
 		}

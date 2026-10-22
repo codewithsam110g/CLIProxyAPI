@@ -448,6 +448,10 @@ type RoutingConfig struct {
 	//     auth errors (429, 401/402/403, 404/model support, invalid_grant) rebind as normal.
 	// Ignored when SessionAffinity is false.
 	SessionAffinityRebindOn string `yaml:"session-affinity-rebind-on,omitempty" json:"session-affinity-rebind-on,omitempty"`
+
+	// SessionQuota tunes the quota reserves and usage polling of the
+	// session-balanced strategy. Other strategies ignore it.
+	SessionQuota SessionQuotaConfig `yaml:"session-quota,omitempty" json:"session-quota,omitempty"`
 }
 
 // OAuthModelAlias defines a model ID alias for a specific channel.

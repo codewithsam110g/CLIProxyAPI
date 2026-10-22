@@ -292,6 +292,11 @@ func (b *Builder) Build() (*Service, error) {
 		appliedRoutingState: appliedRoutingState,
 		serverOptions:       append([]api.ServerOption(nil), b.serverOptions...),
 	}
+	if service.quotaPoller = coreManager.QuotaPoller(); service.quotaPoller == nil {
+		service.quotaPoller = newQuotaPoller(service)
+		coreManager.SetQuotaPoller(service.quotaPoller)
+	}
+	service.applyQuotaPolicy(b.cfg)
 	if b.postAuthHook != nil {
 		service.serverOptions = append(service.serverOptions, api.WithPostAuthHook(b.postAuthHook))
 	}

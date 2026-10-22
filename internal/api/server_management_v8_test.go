@@ -218,3 +218,96 @@ func TestManagementV8PluginOperationMigratesConfiguration(t *testing.T) {
 		t.Fatal("missing configuration reload")
 	}
 }
+
+func TestManagementV8SessionQuotaConfigKeys(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	raw := "config-version: 8\nserver: {port: 8317}\nmanagement: {secret-key: test-password}\nrouting:\n  strategy: session-balanced\n"
+	if err := os.WriteFile(path, []byte(raw), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.AuthDir = t.TempDir()
+	h := management.NewHandler(cfg, path, nil)
+	h.SetLocalPassword("test-password")
+	reloads := make(chan *config.Config, 8)
+	h.SetConfigReloadHook(func(_ context.Context, next *config.Config) { reloads <- next })
+	s := &Server{cfg: cfg, engine: gin.New(), mgmt: h}
+	s.managementRoutesEnabled.Store(true)
+	s.registerManagementRoutes()
+	request := func(method, url, body string, status int) string {
+		t.Helper()
+		req := httptest.NewRequest(method, url, strings.NewReader(body))
+		req.RemoteAddr = "127.0.0.1:1234"
+		req.Header.Set("Authorization", "Bearer test-password")
+		response := httptest.NewRecorder()
+		s.engine.ServeHTTP(response, req)
+		if response.Code != status {
+			t.Fatalf("%s %s: status=%d body=%s", method, url, response.Code, response.Body.String())
+		}
+		return strings.TrimSpace(response.Body.String())
+	}
+	const base = "/v8/management/config/routing/session-quota"
+
+	// Unset keys are absent on read, like other optional routing settings.
+	request(http.MethodGet, base, "", http.StatusNotFound)
+
+	// Scalar PUT, the way the Config panel edits a single field.
+	request(http.MethodPut, base+"/short-window-reserve-percent", `7.5`, http.StatusOK)
+	request(http.MethodPut, base+"/long-window-reserve-percent", `0`, http.StatusOK)
+	request(http.MethodPut, base+"/poll-interval", `"10m"`, http.StatusOK)
+	if got := request(http.MethodGet, base+"/short-window-reserve-percent", "", http.StatusOK); got != "7.5" {
+		t.Fatalf("short reserve = %s", got)
+	}
+	if got := request(http.MethodGet, base+"/long-window-reserve-percent", "", http.StatusOK); got != "0" {
+		t.Fatalf("an explicit zero reserve must be stored, got %s", got)
+	}
+	var group map[string]any
+	if err = json.Unmarshal([]byte(request(http.MethodGet, base, "", http.StatusOK)), &group); err != nil {
+		t.Fatal(err)
+	}
+	if group["short-window-reserve-percent"] != 7.5 || group["long-window-reserve-percent"] != 0.0 || group["poll-interval"] != "10m" {
+		t.Fatalf("group = %v", group)
+	}
+
+	// The hot reload receives the new values. Reloads are published asynchronously
+	// after each save, so wait for the one that carries the last write.
+	for reloaded := false; !reloaded; {
+		select {
+		case next := <-reloads:
+			q := next.Routing.SessionQuota
+			reloaded = q.ShortReservePercent() == 7.5 && q.LongReservePercent() == 0 && q.EffectivePollInterval() == 10*time.Minute
+		case <-time.After(10 * time.Second):
+			t.Fatal("the saved quota settings were never published to the runtime")
+		}
+	}
+
+	// Object PATCH merges; "0" disables polling.
+	request(http.MethodPatch, base, `{"poll-interval":"0","short-window-reserve-percent":6}`, http.StatusOK)
+	saved, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := config.ParseConfigBytes(saved)
+	if err != nil || reloaded.Routing.SessionQuota.EffectivePollInterval() != 0 || reloaded.Routing.SessionQuota.ShortReservePercent() != 6 || reloaded.Routing.SessionQuota.LongReservePercent() != 0 {
+		t.Fatalf("PATCH result: %v\n%s", err, saved)
+	}
+
+	// Out-of-range values are rejected and leave the file untouched.
+	before := string(saved)
+	for _, body := range []string{`{"short-window-reserve-percent":51}`, `{"long-window-reserve-percent":-1}`, `{"poll-interval":"30s"}`, `{"poll-interval":"often"}`} {
+		request(http.MethodPatch, base, body, http.StatusUnprocessableEntity)
+	}
+	request(http.MethodPut, base+"/short-window-reserve-percent", `99`, http.StatusUnprocessableEntity)
+	if after, _ := os.ReadFile(path); string(after) != before {
+		t.Fatal("a rejected write changed the config file")
+	}
+	// Unknown keys are rejected by the strict v8 validation.
+	request(http.MethodPatch, base, `{"reserve":4}`, http.StatusBadRequest)
+
+	// DELETE returns a key to its default.
+	request(http.MethodDelete, base+"/short-window-reserve-percent", "", http.StatusOK)
+	request(http.MethodGet, base+"/short-window-reserve-percent", "", http.StatusNotFound)
+}

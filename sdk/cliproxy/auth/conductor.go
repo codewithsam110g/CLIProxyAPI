@@ -242,6 +242,9 @@ type Manager struct {
 	// authLoadGate allows concurrent credential transactions, but excludes whole-store reloads.
 	// Mutations acquire one permit; Load acquires all permits before reading the store.
 	authLoadGate *semaphore.Weighted
+
+	// quotaPoller actively refreshes Claude/Codex quota observations (see quota_poll.go).
+	quotaPoller atomic.Pointer[QuotaPoller]
 }
 
 // NewManager constructs a manager with optional custom selector and hook.

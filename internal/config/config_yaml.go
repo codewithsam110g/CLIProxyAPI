@@ -388,6 +388,12 @@ func isKnownDefaultValue(path []string, node *yaml.Node) bool {
 		return false
 	}
 
+	// Session quota reserves are pointer-backed: an explicit 0 means "stop only
+	// when the window is exhausted" and must not be pruned back to the default.
+	if len(path) > 0 && (path[len(path)-1] == "short-window-reserve-percent" || path[len(path)-1] == "long-window-reserve-percent") && node != nil && node.Kind == yaml.ScalarNode && (node.Tag == "!!int" || node.Tag == "!!float") {
+		return false
+	}
+
 	// session-date-pin-days is pointer-backed: only an explicit zero is
 	// preserved; the default value must not pollute saves.
 	if len(path) > 0 && path[len(path)-1] == "session-date-pin-days" && node != nil && node.Kind == yaml.ScalarNode && node.Tag == "!!int" && node.Value == "0" {
@@ -405,6 +411,12 @@ func isKnownDefaultValue(path []string, node *yaml.Node) bool {
 		if pinIdx := findMapKeyIndex(node, "session-date-pin-days"); pinIdx >= 0 {
 			return false
 		}
+	}
+
+	// Likewise for an ancestor of an explicit session quota reserve: routing and
+	// routing.session-quota are written new together with their only child.
+	if node != nil && node.Kind == yaml.MappingNode && mappingHasKeyDeep(node, "short-window-reserve-percent", "long-window-reserve-percent") {
+		return false
 	}
 
 	// First check if it's a zero value
@@ -525,6 +537,24 @@ func isZeroValueNode(node *yaml.Node) bool {
 			}
 		}
 		return true
+	}
+	return false
+}
+
+// mappingHasKeyDeep reports whether any mapping at or below node has one of keys.
+func mappingHasKeyDeep(node *yaml.Node, keys ...string) bool {
+	if node == nil || node.Kind != yaml.MappingNode {
+		return false
+	}
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		for _, key := range keys {
+			if node.Content[i].Value == key {
+				return true
+			}
+		}
+		if mappingHasKeyDeep(node.Content[i+1], keys...) {
+			return true
+		}
 	}
 	return false
 }

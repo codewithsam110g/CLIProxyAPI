@@ -6,7 +6,7 @@ This fork adds persistent account ownership for conversations and a matching man
 
 ## Policy
 
-A conversation starts on account A. All its requests stay on A through temporary transport failures, 5xx responses and ordinary request-rate 429s. The proxy can report an error rather than quietly sending the request to B. **1% remaining or less in either shared quota window is the stopping point**, for existing conversations as well as new assignments. A stopped account, confirmed subscription exhaustion, account removal/disablement or unrecoverable authentication failure permits one coordinated move to B. Recovery of A does not move the conversation back. A later independent confirmed failure can cause a further recorded move.
+A conversation starts on account A. All its requests stay on A through temporary transport failures, 5xx responses and ordinary request-rate 429s. The proxy can report an error rather than quietly sending the request to B. **A configurable reserve of remaining quota in either shared window is the stopping point** (defaults: 5% for the short window, 2% for the long window), for existing conversations as well as new assignments. A stopped account, confirmed subscription exhaustion, account removal/disablement or unrecoverable authentication failure permits one coordinated move to B. Recovery of A does not move the conversation back. A later independent confirmed failure can cause a further recorded move.
 
 The existing credential acquisition/refresh path gets its normal opportunity to refresh a token before a terminal authentication result is classified. A model-permission 403 alone is not evidence of a dead account. Confirmed 429s require provider quota markers or the manager's credential-scoped quota classification. User-defined request-scoped error rules retain their stop/skip semantics.
 
@@ -34,11 +34,35 @@ Native session ownership takes precedence over plugin account selection while th
 
 Only new bindings and approved migrations are scored. Candidate filtering respects model support, configured priority, positive weight, credential eligibility, health/cooldown and drain state. Existing pins are honored across priority recovery. Weights are admission gates here, not round-robin shares.
 
-For Claude/Codex, the smallest remaining fraction across fresh shared short/long quota windows limits placement. Observations come from provider response headers, are timestamped and expire after five minutes for scoring. Missing/stale quota stays unknown and uses a conservative score of 0.25. **A remembered quota stop does not expire with that scoring snapshot:** the affected window must reach its reported reset or supply a newer fresh observation above 1%. Missing fields cannot clear another window's stop. Without a reset, a stop remains until verified recovery; unknown accounts can still receive an initial request to learn their quota. The score is `headroom_fraction / (1 + sessions_active_in_last_15_minutes)`. Reset hints break equal scores, then account ID makes selection deterministic.
+For Claude/Codex, the smallest remaining fraction across fresh shared short/long quota windows limits placement. Observations come from provider response headers and from the usage poller below, are timestamped and expire after five minutes for scoring. Missing/stale quota stays unknown and uses a conservative score of 0.25. **A remembered quota stop does not expire with that scoring snapshot:** the affected window must reach its reported reset or supply a newer fresh observation above that window's reserve. Missing fields cannot clear another window's stop. Without a reset, a stop remains until verified recovery; unknown accounts can still receive an initial request to learn their quota. The score is `headroom_fraction / (1 + sessions_active_in_last_15_minutes)`. Reset hints break equal scores, then account ID makes selection deterministic.
 
-Confirmed credential quota is considered for every conversation using that account, including bindings other than the one that received the failure. Each conversation migrates on its own next safe request. Quota-stopped accounts are excluded before priority selection and cannot be manual-move targets. If all compatible accounts are stopped, routing returns an error and retains ownership. Subagents inherit a usable parent's account; a quota-stopped parent does not force a new child onto the stopped account.
+Confirmed credential quota is considered for every conversation using that account, including bindings other than the one that received the failure. Each conversation migrates on its own next safe request. Quota-stopped accounts are excluded before priority selection and cannot be manual-move targets. **Reserves are soft:** a reserve-only stop moves a conversation and blocks new assignments only while some compatible account is outside its reserve. When every compatible account is inside its reserve, existing conversations stay on their account (keeping its cache) and new conversations go to the account with the most room, until the provider actually refuses. An exhausted account (confirmed quota, or a window at 0% remaining) is never used; if every compatible account is exhausted, routing returns an error and retains ownership. Subagents inherit a usable parent's account; a quota-stopped parent does not force a new child onto the stopped account.
 
-This is a session-load heuristic, not an exact token-budget predictor. There is no subscription-percent-to-token conversion, synthetic remaining allowance, cross-account cache merger, latency predictor or provider quota polling service. The quota dashboard's probes remain separate from the router's passive observations. Provider-side usage outside this proxy can make observations stale.
+This is a session-load heuristic, not an exact token-budget predictor. There is no subscription-percent-to-token conversion, synthetic remaining allowance, cross-account cache merger or latency predictor. Provider-side usage outside this proxy can make observations stale; the poller below narrows that gap but does not close it.
+
+## Quota reserves and usage polling
+
+Reserves are set per window class under `routing.session-quota` and are hot-reloaded:
+
+```yaml
+routing:
+  session-quota:
+    short-window-reserve-percent: 5   # Claude 5-hour / Codex primary; 0-50, default 5
+    long-window-reserve-percent: 2    # Claude 7-day / Codex secondary; 0-50, default 2
+    poll-interval: 5m                 # "0" disables polling; otherwise at least 1m, default 5m
+```
+
+An account is stopped when any one of its windows has its reserve or less remaining, and the stop reason names the window, for example `5-hour window at 3% remaining (reserve 5%)`. The short reserve is wider because one long agent turn can use more than 1% of a five-hour window. Out-of-range values are rejected, not clamped, so a typo cannot silently weaken or strengthen the policy. A Codex window is classed by its reported length when present, so a plan that reports only a weekly window as "primary" gets the long reserve.
+
+A reserve change takes effect without a restart and never invalidates the state file. Stops are stored with the observation that caused them, not the reserve in force at the time. Raising a reserve stops accounts already inside it at once. Lowering a reserve does not release a stop by itself: only a newer fresh observation above the lower reserve does, as for any recovery, and, while polling is enabled, the poller fetches one immediately when a reserve changes. Conversations already pinned to a stopped account still move on their next safe request when another compatible account is outside its reserve (see the soft-reserve rule above).
+
+**Usage poller.** Every `poll-interval` the proxy fetches usage for each enabled Claude and Codex OAuth account, using the endpoints and headers the dashboard's quota page uses (Claude `GET /api/oauth/usage` with `anthropic-beta: oauth-2025-04-20`; Codex `GET /backend-api/wham/usage` with the account's `Chatgpt-Account-Id`), and records the result as the account's quota observation. It reaches the router by the same path as header observations, so scoring, stops and migration are unchanged. The first poll runs at startup. It runs only while `session-balanced` is selected and never in Home mode. `POST /v8/management/routing/accounts/refresh-quota` polls on demand.
+
+- A poll replaces the base rate-limit signals it owns (the 5-hour/7-day or primary/secondary windows, their resets and limit flags, and Retry-After) and keeps the descriptive ones only response headers carry (plan, credits, additional and code-review limits). A window the provider omits is dropped, so an old reading never sits under a fresh timestamp. A poll that finishes after a newer response-header observation is discarded.
+- A poll writes only the observation. It never touches cooldown state, so it cannot start a cooldown or end one early; a confirmed credential-quota stop is released only by the existing recovery rules.
+- A failed poll (HTTP error, unparseable or empty response, token refresh failure) keeps the last observation, never stops or releases an account and is reported as `last_poll_error` in the snapshot. Access tokens come from the credential's own metadata; a token that is expired or about to expire goes through the normal refresh path first, whose own failure handling applies. Tokens and response bodies are never logged or stored.
+- No timeout is set on a poll once its connection is established. At most one poll per account runs at a time: a tick skips an account that is still being polled, and a stuck poll holds only its own account. Shutdown cancels in-flight polls.
+- The usage endpoints are the provider's own internal ones, not a published API; a provider change shows up as `unparseable response` or `no usage windows in response` rather than as a wrong reading.
 
 ## Persistence and safe continuation
 
@@ -63,6 +87,7 @@ Protected v8 endpoints:
 | `GET /v8/management/routing/sessions` | Snapshot; `enabled:false` when another strategy is selected |
 | `POST /v8/management/routing/accounts/drain` | `{ "auth_id": "...", "draining": true }` |
 | `POST /v8/management/routing/sessions/move` | `{ "id": "...", "auth_id": "...", "expected_generation": 1 }` |
+| `POST /v8/management/routing/accounts/refresh-quota` | `{ "auth_id": "..." }` for one account, `{}` for all; polls usage now |
 
 Token accounting uses the canonical non-overlapping input/cache-read/cache-write/output buckets. Cache-read ratio is total cache-read tokens divided by total input tokens for complete observations. Incomplete observations are counted and disclosed. Counters cover requests through this proxy during the binding lifetime and are not a permanent analytics/billing ledger. Cache-write tokens are not cache hits. Stable account routing preserves cache opportunity; cache hits still depend on the provider, model, prompt prefix and cache lifetime.
 

@@ -82,6 +82,17 @@ type RoutingAccount struct {
 	ObservedAt       time.Time `json:"observed_at"`
 	QuotaStopped     bool      `json:"quota_stopped"`
 	QuotaStopReason  string    `json:"quota_stop_reason,omitempty"`
+	// QuotaExhausted distinguishes a provider-enforced stop from a reserve-only
+	// stop, which still serves when every compatible account is in reserve.
+	QuotaExhausted bool `json:"quota_exhausted"`
+	// Windows lists the shared quota windows (short, then long) for Claude and
+	// Codex accounts; it is empty for other providers.
+	Windows []RoutingWindow `json:"windows"`
+	// LastPollAt, LastPollSuccessAt are RFC3339 or "" when never polled.
+	// LastPollError is a short non-secret classification of the latest failed poll.
+	LastPollAt        string `json:"last_poll_at"`
+	LastPollSuccessAt string `json:"last_poll_success_at"`
+	LastPollError     string `json:"last_poll_error"`
 }
 
 type BalancedRoutingSnapshot struct {
@@ -89,6 +100,10 @@ type BalancedRoutingSnapshot struct {
 	StateError string           `json:"state_error,omitempty"`
 	Sessions   []SessionBinding `json:"sessions"`
 	Accounts   []RoutingAccount `json:"accounts"`
+	// QuotaPollIntervalSeconds is the effective polling cadence; 0 when polling is off.
+	QuotaPollIntervalSeconds  int     `json:"quota_poll_interval_seconds"`
+	ShortWindowReservePercent float64 `json:"short_window_reserve_percent"`
+	LongWindowReservePercent  float64 `json:"long_window_reserve_percent"`
 }
 
 // SessionBalancedSelector chooses accounts only for new sessions and confirmed
@@ -107,13 +122,15 @@ type SessionBalancedSelector struct {
 	stopped        bool
 	accounts       func() []*Auth
 	supports       func(*Auth, string) bool
+	reserves       SessionQuotaReserves
+	pollInfo       quotaPollInfo
 }
 
 func NewSessionBalancedSelector(path string, ttl time.Duration) *SessionBalancedSelector {
 	if ttl <= 0 {
 		ttl = 24 * time.Hour
 	}
-	s := &SessionBalancedSelector{path: path, ttl: ttl, now: time.Now}
+	s := &SessionBalancedSelector{path: path, ttl: ttl, now: time.Now, reserves: DefaultSessionQuotaReserves()}
 	s.reload()
 	return s
 }
@@ -246,6 +263,7 @@ func (m *Manager) attachBalancedSelector(selector Selector) {
 		s.supports = func(a *Auth, model string) bool {
 			return m.authSupportsRouteModel(registry.GetGlobalRegistry(), a, model)
 		}
+		s.pollInfo = m
 	}
 }
 
@@ -320,9 +338,27 @@ func (s *SessionBalancedSelector) Pick(ctx context.Context, provider, model stri
 		}
 		return nil
 	}
+	// hasRoomOutsideReserve reports a compatible account other than exclude that is
+	// not quota-stopped; without one, reserve-only stops do not force a move.
+	hasRoomOutsideReserve := func(exclude, provider string) bool {
+		for _, a := range auths {
+			if a != nil && a.ID != exclude && (provider == "" || a.Provider == provider) && !s.state.Draining[a.ID] && authWeight(a) > 0 && s.quotaStopReason(a.ID) == "" {
+				return true
+			}
+		}
+		return false
+	}
 	reason := "quota and recent-session load"
+	if b != nil && b.PendingAuthID == "" && b.PendingReason != "" && pickByID(b.AuthID) != nil && s.quotaStopReason(b.AuthID) != "" && !s.quotaExhausted(b.AuthID) && !hasRoomOutsideReserve(b.AuthID, b.Provider) {
+		// Every alternative is inside its reserve too: staying keeps the cache and
+		// spends this account's reserve instead of failing the conversation.
+		b.PendingReason = ""
+		if err := s.persist(); err != nil {
+			return nil, routingError("session_state_unavailable", "session state could not be persisted", 503)
+		}
+	}
 	if b != nil && b.PendingReason == "" {
-		if stopped := s.quotaStopReason(b.AuthID); stopped != "" {
+		if stopped := s.quotaStopReason(b.AuthID); stopped != "" && (s.quotaExhausted(b.AuthID) || hasRoomOutsideReserve(b.AuthID, b.Provider)) {
 			b.PendingReason = stopped
 			if err := s.persist(); err != nil {
 				return nil, routingError("session_state_unavailable", "session migration could not be persisted", 503)
@@ -371,16 +407,28 @@ func (s *SessionBalancedSelector) Pick(ctx context.Context, provider, model stri
 			return nil, sessionReconnectRequired()
 		}
 		reason = "transport session"
-	} else if b == nil && parentBinding != nil && isSubagentSession(primary, parent) && s.quotaStopReason(parentBinding.AuthID) == "" {
+	} else if b == nil && parentBinding != nil && isSubagentSession(primary, parent) && (s.quotaStopReason(parentBinding.AuthID) == "" || (!s.quotaExhausted(parentBinding.AuthID) && !hasRoomOutsideReserve("", parentBinding.Provider))) {
 		chosen = pickByID(parentBinding.AuthID)
 		if chosen == nil {
 			return nil, routingError("session_account_unavailable", "the parent session account is unavailable", 503)
 		}
 		reason = "parent session"
 	} else {
+		provider := ""
+		if b != nil {
+			provider = b.Provider
+		}
+		// Prefer accounts outside their reserve; when none exists, spend reserves.
+		allowReserve := !hasRoomOutsideReserve("", provider)
+		if b != nil {
+			allowReserve = !hasRoomOutsideReserve(b.AuthID, provider)
+		}
 		candidates := make([]*Auth, 0, len(auths))
 		for _, a := range auths {
-			if a == nil || s.state.Draining[a.ID] || authWeight(a) <= 0 || s.quotaStopReason(a.ID) != "" {
+			if a == nil || s.state.Draining[a.ID] || authWeight(a) <= 0 {
+				continue
+			}
+			if s.quotaStopReason(a.ID) != "" && (!allowReserve || s.quotaExhausted(a.ID)) {
 				continue
 			}
 			if b != nil && (a.Provider != b.Provider || a.ID == b.AuthID) {
@@ -601,18 +649,56 @@ func (s *SessionBalancedSelector) Snapshot() BalancedRoutingSnapshot {
 		}
 	}
 	sort.Slice(out.Sessions, func(i, j int) bool { return out.Sessions[i].LastSeen.After(out.Sessions[j].LastSeen) })
+	out.Accounts = s.accountEntries(now, nil)
+	out.ShortWindowReservePercent = s.reserves.Short
+	out.LongWindowReservePercent = s.reserves.Long
+	if s.pollInfo != nil {
+		out.QuotaPollIntervalSeconds = int(s.pollInfo.QuotaPollInterval() / time.Second)
+	}
+	return out
+}
+
+// AccountSnapshots returns the routing entries of the given accounts, or of all
+// accounts when none are named, after re-evaluating quota stops.
+func (s *SessionBalancedSelector) AccountSnapshots(ids ...string) []RoutingAccount {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := s.now()
+	if s.loadErr == nil && !s.stopped && s.refreshQuotaStops(nil, now) {
+		_ = s.persist()
+	}
+	var only map[string]bool
+	if len(ids) > 0 {
+		only = make(map[string]bool, len(ids))
+		for _, id := range ids {
+			only[id] = true
+		}
+	}
+	return s.accountEntries(now, only)
+}
+
+// Caller holds s.mu.
+func (s *SessionBalancedSelector) accountEntries(now time.Time, only map[string]bool) []RoutingAccount {
+	entries := []RoutingAccount{}
 	if s.accounts != nil {
 		for _, a := range s.accounts() {
-			if a == nil {
+			if a == nil || (only != nil && !only[a.ID]) {
 				continue
 			}
 			remaining, _ := accountHeadroom(a, now)
 			stopReason := s.quotaStopReason(a.ID)
-			out.Accounts = append(out.Accounts, RoutingAccount{ID: a.ID, Label: a.Label, Provider: a.Provider, Disabled: a.Disabled || a.Status == StatusDisabled, Draining: s.state.Draining[a.ID], RecentSessions: s.recentSessions(a.ID, now), RemainingPercent: remaining, ObservedAt: a.Quota.ObservedAt, QuotaStopped: stopReason != "", QuotaStopReason: stopReason})
+			entry := RoutingAccount{ID: a.ID, Label: a.Label, Provider: a.Provider, Disabled: a.Disabled || a.Status == StatusDisabled, Draining: s.state.Draining[a.ID], RecentSessions: s.recentSessions(a.ID, now), RemainingPercent: remaining, ObservedAt: a.Quota.ObservedAt, QuotaStopped: stopReason != "", QuotaStopReason: stopReason, QuotaExhausted: s.quotaExhausted(a.ID), Windows: s.accountWindows(a, now)}
+			if s.pollInfo != nil {
+				status := s.pollInfo.QuotaPollStatus(a.ID)
+				entry.LastPollAt = formatPollTime(status.LastPollAt)
+				entry.LastPollSuccessAt = formatPollTime(status.LastSuccessAt)
+				entry.LastPollError = status.LastError
+			}
+			entries = append(entries, entry)
 		}
 	}
-	sort.Slice(out.Accounts, func(i, j int) bool { return out.Accounts[i].ID < out.Accounts[j].ID })
-	return out
+	sort.Slice(entries, func(i, j int) bool { return entries[i].ID < entries[j].ID })
+	return entries
 }
 
 func (s *SessionBalancedSelector) SetDraining(id string, draining bool) error {

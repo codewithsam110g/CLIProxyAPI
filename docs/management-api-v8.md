@@ -42,6 +42,7 @@ the corresponding group value. Legacy field names are rejected by v8 writes.
 | `/config/client/codex/optimize-multi-agent-v2` | Boolean, default `false`; applies to Codex clients across OAuth and API-key routes. |
 | `/config/observability/logs/debug` | A boolean, for example `true`. |
 | `/config/routing/retry/request-retry` | A number, for example `0`. |
+| `/config/routing/session-quota` | Session-balanced quota reserves and polling (fork extension), for example `{"short-window-reserve-percent":5}`. |
 | `/config/plugins/configs/<id>` | A plugin configuration object. |
 
 For example, `PATCH /v8/management/config` with this body disables additional
@@ -94,6 +95,7 @@ retain the corresponding business operation's fields.
 | `/routing/sessions` | GET | Session-balanced routing snapshot (fork extension). |
 | `/routing/sessions/move` | POST | Request a deferred account move with expected binding generation (fork extension). |
 | `/routing/accounts/drain` | POST | Stop/resume new assignments to an account (fork extension). |
+| `/routing/accounts/refresh-quota` | POST | Poll Claude/Codex usage now for one account or all (fork extension). |
 | `/routing/model-definitions/<channel>` | GET | Get model definitions. |
 | `/observability/logs` | GET, DELETE | Read or clear application logs. |
 | `/observability/logs/errors` | GET | List error-log files. |
@@ -167,10 +169,80 @@ extensions retain their declared `/v0/management` routes.
 
 ## Session-balanced routing extension
 
-These routes share the v8 management authentication boundary. `GET /routing/sessions` returns `enabled`, `sessions`, `accounts` and optional `state_error`. Disabled mode returns empty arrays and `enabled:false`. Snapshot data contains routing metadata and canonical token counters, never provider credentials. Account entries include `quota_stopped` and `quota_stop_reason`. A shared window at 1% remaining or less stops both new assignments and existing pinned requests; each conversation migrates on its next safe request. Stops survive stale or missing scoring observations until the window resets or a newer fresh observation confirms recovery.
+These routes share the v8 management authentication boundary.
+
+### Configuration
+
+`routing.session-quota` is read and written like any other config group (`GET`/`PUT`/`PATCH`/`DELETE` on `/config/routing/session-quota` or one of its fields) and is applied on save without a restart. It applies only while `routing.strategy` is `session-balanced`.
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `short-window-reserve-percent` | number, 0 to 50 | `5` | Stop an account once its short window (Claude 5-hour, Codex primary) has this much or less remaining. |
+| `long-window-reserve-percent` | number, 0 to 50 | `2` | The same for the long window (Claude 7-day, Codex secondary). |
+| `poll-interval` | duration string | `"5m"` | How often the proxy polls Claude and Codex usage. `"0"` disables background polling. Otherwise at least `"1m"`. |
+
+An absent key means its default; `DELETE` on a field returns it to the default. A reserve of `0` is valid and means "stop only when the window is used up". Out-of-range reserves, an unparsable `poll-interval` and one between `0` and `1m` are rejected: a write returns 422 and leaves the file unchanged, and loading a config file that contains one fails. Unknown keys under `session-quota` are rejected by v8 validation.
+
+### Snapshot
+
+`GET /routing/sessions` returns `enabled`, `sessions`, `accounts`, the polling and reserve settings in force, and optional `state_error`. Disabled mode returns `enabled:false`, empty arrays, `quota_poll_interval_seconds: 0` and the configured reserves. Snapshot data contains routing metadata and canonical token counters, never provider credentials.
+
+```json
+{
+  "enabled": true,
+  "quota_poll_interval_seconds": 300,
+  "short_window_reserve_percent": 5,
+  "long_window_reserve_percent": 2,
+  "accounts": [
+    {
+      "id": "codex-user@example.com",
+      "label": "user@example.com",
+      "provider": "codex",
+      "disabled": false,
+      "draining": false,
+      "recent_sessions": 2,
+      "remaining_percent": 3,
+      "observed_at": "2026-10-22T08:15:03.412Z",
+      "quota_stopped": true,
+      "quota_exhausted": false,
+      "quota_stop_reason": "5-hour window at 3% remaining (reserve 5%)",
+      "windows": [
+        {"kind": "short", "label": "5-hour", "remaining_percent": 3, "reset_at": "2026-10-22T10:30:00Z", "reserve_percent": 5, "stopped": true},
+        {"kind": "long", "label": "weekly", "remaining_percent": 61, "reset_at": "2026-10-25T00:00:00Z", "reserve_percent": 2, "stopped": false}
+      ],
+      "last_poll_at": "2026-10-22T08:15:03Z",
+      "last_poll_success_at": "2026-10-22T08:15:03Z",
+      "last_poll_error": ""
+    }
+  ],
+  "sessions": []
+}
+```
+
+- `remaining_percent` (account) is the smallest remaining percentage across the fresh windows, or `null` when the observation is missing or older than five minutes. Within a window, `remaining_percent` follows the same rule and is also `null` once the window's `reset_at` has passed.
+- `windows` lists the account's Claude/Codex windows, short first. It holds a window while the latest observation includes it or a stop on it is still held (a stop outlives the observation that caused it, so such a window shows `stopped: true` with `remaining_percent: null`). Before any observation an OAuth account lists both windows with `remaining_percent: null` and `stopped: false`. API-key accounts and other providers list `[]`.
+- `kind` is `short` or `long`. `label` is `5-hour`, `weekly`, or `monthly` (a Codex long window the provider reports as about a month long). A Codex window is classified by its reported length when present, so a plan that reports only a weekly window as "primary" is a `long` window with the long reserve.
+- `reset_at` is RFC 3339 UTC, or `""` when unknown or already passed. `reserve_percent` is the reserve applied to that window now.
+- `quota_exhausted` is true for a provider-enforced stop (confirmed quota or a window at 0% remaining). `quota_stopped && !quota_exhausted` means the account is inside its reserve: it is used only when every compatible account is in reserve.
+- `quota_stopped` and `quota_stop_reason` describe all stops on the account. Reasons read `5-hour window at 3% remaining (reserve 5%)`, `weekly window at 1% remaining (reserve 2%)`, `confirmed credential quota` or `confirmed quota exhaustion`; several are joined with `; `.
+- `last_poll_at` is when the latest poll attempt finished, `last_poll_success_at` when the latest successful one did, and `last_poll_error` a short classification of the latest failed attempt such as `HTTP 401`, `HTTP 429`, `token refresh failed`, `request failed` or `unparseable response` (it never contains a token or response body; `""` after a success). Unpolled accounts have `""` for all three.
+
+A window at or below its reserve stops the account for new assignments and moves its pinned conversations on their next safe request, as long as another compatible account is outside its reserve. Reserves are soft: when every compatible account is inside its reserve, conversations stay on their account and new ones go to the account with the most room; only exhausted accounts (`quota_exhausted`) are never used. Stops survive stale or missing observations until the window reaches its reported reset or a newer fresh observation shows it above that window's reserve. Raising a reserve stops accounts already inside it immediately. Lowering one releases a stop only when a fresh observation confirms the window is above the lower reserve (with polling enabled, the proxy polls right away when a reserve changes). A poll failure never stops or releases an account.
+
+### Refresh
+
+`POST /routing/accounts/refresh-quota` polls provider usage now and waits for the result. The body is `{"auth_id":"account-id"}` for one account, or `{}` (or empty) for every Claude and Codex OAuth account that can be polled. It returns 409 when session-balanced is not enabled, 404 for an unknown `auth_id`, 400 for an `auth_id` that cannot be polled (not a Claude/Codex OAuth credential, disabled, or terminally unauthorized) or a malformed body, and 503 if quota polling is unavailable.
+
+```json
+{"status": "ok", "coalesced_auth_ids": ["codex-user@example.com"], "accounts": [ /* the updated account entries, as in the snapshot */ ]}
+```
+
+An account whose poll finished less than 15 seconds ago is not polled again; its id is listed in `coalesced_auth_ids` and its entry reports that poll's outcome. An account already being polled is joined rather than polled twice. A failed poll still returns 200: read `last_poll_error` on the entry.
+
+### Controls
 
 `POST /routing/accounts/drain` accepts `{"auth_id":"account-id","draining":true}`. The boolean is required, including when resuming with false. Existing sessions keep their account.
 
 `POST /routing/sessions/move` accepts `{"id":"binding-id","auth_id":"target-id","expected_generation":1}`. The target must be compatible, available and non-draining. The response reports pending status; migration happens only on a subsequent safe request. Stale generations and incompatible targets return 409. Missing/invalid fields return 400. Mutation endpoints return 409 when session-balanced is not enabled.
 
-See [fork policy](../FORK.md) for persistence, failure classification and continuation constraints.
+See [fork policy](../FORK.md) for persistence, failure classification, polling and continuation constraints.

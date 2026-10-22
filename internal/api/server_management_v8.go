@@ -33,6 +33,7 @@ func (s *Server) registerManagementV8Routes() {
 	v8.GET("/routing/sessions", s.mgmt.GetRoutingSessions)
 	v8.POST("/routing/sessions/move", s.mgmt.MoveRoutingSession)
 	v8.POST("/routing/accounts/drain", s.mgmt.DrainRoutingAccount)
+	v8.POST("/routing/accounts/refresh-quota", s.mgmt.RefreshRoutingQuota)
 	v8.GET("/routing/model-definitions/:channel", s.mgmt.GetStaticModelDefinitions)
 
 	v8.GET("/observability/logs", s.mgmt.GetLogs)

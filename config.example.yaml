@@ -151,7 +151,8 @@ routing:
   # session-balanced always pins accounts, independently of session-affinity below.
   # Bindings are saved in oauth.auth-dir/.session-affinity.state; mount that directory persistently.
   # It preserves pins through temporary errors and migrates only on confirmed quota/account failure.
-  # Fresh provider quota observations and recent-session load guide NEW session placement.
+  # Fresh provider quota observations (response headers plus periodic usage polling, see session-quota
+  # below) and recent-session load guide NEW session placement.
   # The routing/sessions management endpoints expose pins, usage and manual move/drain controls.
   # weighted-round-robin uses each credential's integer weight (default 1, maximum 1,000,000).
   # Non-positive weights exclude the credential while this strategy is active.
@@ -181,6 +182,21 @@ routing:
   #     errors (429, 401/402/403, 404/model support, invalid_grant) rebind as normal.
   # Ignored when routing.session-affinity is false.
   session-affinity-rebind-on: "any"
+
+  # Quota reserves and usage polling for routing.strategy: session-balanced (ignored otherwise).
+  # An account is stopped, for new and existing conversations, once a shared quota window has
+  # this much or less REMAINING. Existing conversations then migrate on their next safe request.
+  # The short window is Claude's 5-hour / Codex's primary window; the long window is
+  # Claude's 7-day / Codex's secondary window. Valid range 0-50 (a value outside it is rejected).
+  # The proxy also polls each enabled Claude and Codex OAuth account's usage so idle accounts are
+  # not "unknown" and a nearly exhausted one is noticed before traffic reaches it.
+  # All three keys are optional and hot-reloaded; the values below are the defaults.
+  session-quota:
+    short-window-reserve-percent: 5 # default 5
+    long-window-reserve-percent: 2 # default 2
+    # How often to poll provider usage. "0" disables background polling (the
+    # POST /v8/management/routing/accounts/refresh-quota endpoint still works). Minimum 1m.
+    poll-interval: "5m" # default 5m
 
   # When true, unprefixed model requests only use credentials without a prefix (except when prefix == model name).
   force-model-prefix: false
